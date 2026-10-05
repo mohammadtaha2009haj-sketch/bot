@@ -4,67 +4,212 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 function envCheck() {
-  const missing = ['TELEGRAM_BOT_TOKEN','ADMIN_CHAT_ID','SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY']
-    .filter(k => !process.env[k]);
-  if (missing.length) throw new Error(`Missing environment variables: ${missing.join(', ')}`);
+  const missing = [
+    'TELEGRAM_BOT_TOKEN',
+    'ADMIN_CHAT_ID',
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_ROLE_KEY'
+  ].filter(k => !process.env[k]);
+
+  if (missing.length) {
+    throw new Error(`Missing environment variables: ${missing.join(', ')}`);
+  }
 }
 
 async function telegram(method, body) {
-  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+  const r = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    }
+  );
+
   const data = await r.json();
-  if (!data.ok) throw new Error(`Telegram ${method}: ${JSON.stringify(data)}`);
+
+  if (!data.ok) {
+    throw new Error(
+      `Telegram ${method}: ${JSON.stringify(data)}`
+    );
+  }
+
   return data.result;
 }
 
 async function supabase(path, options = {}) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: options.prefer || 'return=representation',
-      ...(options.headers || {})
+  const r = await fetch(
+    `${SUPABASE_URL}/rest/v1/${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: options.prefer || 'return=representation',
+        ...(options.headers || {})
+      }
     }
-  });
+  );
+
   const text = await r.text();
+
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!r.ok) throw new Error(`Supabase ${r.status}: ${text}`);
+
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  if (!r.ok) {
+    throw new Error(`Supabase ${r.status}: ${text}`);
+  }
+
   return data;
 }
 
-function textOf(m) { return (m?.text || m?.caption || '').trim(); }
+function textOf(m) {
+  return (m?.text || m?.caption || '').trim();
+}
+
 function receiptData(m) {
   if (Array.isArray(m?.photo) && m.photo.length) {
     const p = m.photo[m.photo.length - 1];
-    return { file_id: p.file_id, unique_id: p.file_unique_id, type: 'photo' };
+
+    return {
+      file_id: p.file_id,
+      unique_id: p.file_unique_id,
+      type: 'photo',
+      mime_type: 'image/jpeg'
+    };
   }
-  if (m?.document) return {
-    file_id: m.document.file_id,
-    unique_id: m.document.file_unique_id,
-    type: 'document'
-  };
+
+  if (m?.document) {
+    return {
+      file_id: m.document.file_id,
+      unique_id: m.document.file_unique_id,
+      type: 'document',
+      mime_type: m.document.mime_type || 'application/octet-stream',
+      file_name: m.document.file_name || null
+    };
+  }
+
   return null;
 }
 
-function esc(value) {
-  return String(value ?? '').replace(/([\\`*_{}\[\]()<>#+\-.!|])/g, '\\$1');
+/**
+ * دریافت فایل واقعی از Telegram و ذخیره در Supabase Storage
+ */
+async function storeReceiptInStorage(orderId, rec) {
+  // دریافت اطلاعات فایل از Telegram
+  const fileInfo = await telegram('getFile', {
+    file_id: rec.file_id
+  });
+
+  if (!fileInfo?.file_path) {
+    throw new Error('Telegram did not return file_path');
+  }
+
+  // دانلود فایل واقعی از Telegram
+  const telegramFileUrl =
+    `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+
+  const fileResponse = await fetch(telegramFileUrl);
+
+  if (!fileResponse.ok) {
+    throw new Error(
+      `Could not download Telegram file: ${fileResponse.status}`
+    );
+  }
+
+  const fileBuffer = await fileResponse.arrayBuffer();
+
+  // استخراج پسوند امن
+  let extension = '';
+
+  if (rec.type === 'photo') {
+    extension = '.jpg';
+  } else {
+    const originalName =
+      rec.file_name ||
+      fileInfo.file_path.split('/').pop() ||
+      '';
+
+    const match = originalName.match(/\.[a-zA-Z0-9]{1,10}$/);
+
+    if (match) {
+      extension = match[0].toLowerCase();
+    }
+  }
+
+  if (!extension) {
+    extension = rec.type === 'photo' ? '.jpg' : '.bin';
+  }
+
+  // فقط کاراکترهای مجاز در مسیر
+  extension = extension.replace(/[^a-zA-Z0-9.]/g, '');
+
+  const storagePath =
+    `orders/${orderId}/receipt-${Date.now()}${extension}`;
+
+  // آپلود به Bucket خصوصی
+  const uploadResponse = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/order-receipts/${storagePath}`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': rec.mime_type || 'application/octet-stream',
+        'x-upsert': 'true'
+      },
+      body: fileBuffer
+    }
+  );
+
+  const uploadText = await uploadResponse.text();
+
+  if (!uploadResponse.ok) {
+    throw new Error(
+      `Supabase Storage ${uploadResponse.status}: ${uploadText}`
+    );
+  }
+
+  // ذخیره مسیر فایل در سفارش
+  await supabase(`orders?id=eq.${encodeURIComponent(orderId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      receipt_storage_path: storagePath,
+      updated_at: new Date().toISOString()
+    })
+  });
+
+  return storagePath;
 }
 
 export default async function handler(req, res) {
-  if (req.method === 'GET') return res.status(200).send('Telegram Order Bot is running.');
-  if (req.method !== 'POST') return res.status(405).json({ ok: false });
+  if (req.method === 'GET') {
+    return res
+      .status(200)
+      .send('Telegram Order Bot is running.');
+  }
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false });
+  }
 
   try {
     envCheck();
+
     const update = req.body || {};
     const message = update.message;
-    if (!message?.chat?.id) return res.status(200).json({ ok: true });
+
+    if (!message?.chat?.id) {
+      return res.status(200).json({ ok: true });
+    }
 
     const chatId = message.chat.id;
     const from = message.from || {};
@@ -74,6 +219,7 @@ export default async function handler(req, res) {
     const customers = await supabase(
       `bot_customers?telegram_chat_id=eq.${encodeURIComponent(chatId)}&select=*`
     );
+
     let customer = customers?.[0];
 
     if (!customer) {
@@ -88,29 +234,53 @@ export default async function handler(req, res) {
           updated_at: now
         })
       });
+
       customer = created?.[0];
     } else {
-      const updated = await supabase(`bot_customers?id=eq.${customer.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          telegram_user_id: from.id ?? customer.telegram_user_id ?? null,
-          username: from.username ?? customer.username ?? null,
-          first_name: from.first_name ?? customer.first_name ?? null,
-          last_name: from.last_name ?? customer.last_name ?? null,
-          updated_at: now
-        })
-      });
+      const updated = await supabase(
+        `bot_customers?id=eq.${customer.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({
+            telegram_user_id:
+              from.id ?? customer.telegram_user_id ?? null,
+            username:
+              from.username ?? customer.username ?? null,
+            first_name:
+              from.first_name ?? customer.first_name ?? null,
+            last_name:
+              from.last_name ?? customer.last_name ?? null,
+            updated_at: now
+          })
+        }
+      );
+
       customer = updated?.[0] || customer;
     }
 
-    if (incomingText.toLowerCase() === '/start' || incomingText.toLowerCase() === '/cancel') {
-      await supabase(`orders?telegram_chat_id=eq.${encodeURIComponent(chatId)}&status=in.(collecting,pending_admin)`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'cancelled', current_step: 'completed', updated_at: now })
-      });
+    if (
+      incomingText.toLowerCase() === '/start' ||
+      incomingText.toLowerCase() === '/cancel'
+    ) {
+      await supabase(
+        `orders?telegram_chat_id=eq.${encodeURIComponent(chatId)}&status=in.(collecting,pending_admin)`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({
+            status: 'cancelled',
+            current_step: 'completed',
+            updated_at: now
+          })
+        }
+      );
 
       if (incomingText.toLowerCase() === '/cancel') {
-        await telegram('sendMessage', { chat_id: chatId, text: 'سفارش فعلی لغو شد. برای ثبت سفارش جدید /start را بفرستید.' });
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'سفارش فعلی لغو شد. برای ثبت سفارش جدید /start را بفرستید.'
+        });
+
         return res.status(200).json({ ok: true });
       }
 
@@ -124,102 +294,253 @@ export default async function handler(req, res) {
           current_step: 'product_code'
         })
       });
-      if (!created?.[0]) throw new Error('Could not create order');
+
+      if (!created?.[0]) {
+        throw new Error('Could not create order');
+      }
+
       await telegram('sendMessage', {
         chat_id: chatId,
-        text: 'سلام 👋\nبرای ثبت سفارش، کد محصول را ارسال کنید.\n\nدر هر مرحله فقط اطلاعات خواسته‌شده را بفرستید.'
+        text:
+          'سلام 👋\nبرای ثبت سفارش، کد محصول را ارسال کنید.\n\nدر هر مرحله فقط اطلاعات خواسته‌شده را بفرستید.'
       });
+
       return res.status(200).json({ ok: true });
     }
 
     const orders = await supabase(
       `orders?telegram_chat_id=eq.${encodeURIComponent(chatId)}&status=eq.collecting&order=created_at.desc&limit=1&select=*`
     );
+
     let order = orders?.[0];
 
     if (!order) {
-      await telegram('sendMessage', { chat_id: chatId, text: 'برای شروع ثبت سفارش، /start را ارسال کنید.' });
+      await telegram('sendMessage', {
+        chat_id: chatId,
+        text:
+          'برای شروع ثبت سفارش، /start را ارسال کنید.'
+      });
+
       return res.status(200).json({ ok: true });
     }
 
     if (order.current_step === 'product_code') {
       if (!incomingText || incomingText.length > 100) {
-        await telegram('sendMessage', { chat_id: chatId, text: 'کد محصول معتبر نیست. لطفاً فقط کد محصول را ارسال کنید.' });
-      } else {
-        const updated = await supabase(`orders?id=eq.${order.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ product_code: incomingText, current_step: 'customer_name', updated_at: now })
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'کد محصول معتبر نیست. لطفاً فقط کد محصول را ارسال کنید.'
         });
-        order = updated?.[0] || order;
-        await telegram('sendMessage', { chat_id: chatId, text: 'نام و نام خانوادگی خود را ارسال کنید.' });
-      }
-    } else if (order.current_step === 'customer_name') {
-      if (!incomingText || incomingText.length > 150) {
-        await telegram('sendMessage', { chat_id: chatId, text: 'نام و نام خانوادگی را به‌صورت کامل ارسال کنید.' });
       } else {
-        const updated = await supabase(`orders?id=eq.${order.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ customer_name: incomingText, current_step: 'address', updated_at: now })
-        });
-        order = updated?.[0] || order;
-        await telegram('sendMessage', { chat_id: chatId, text: 'آدرس دقیق دریافت سفارش را ارسال کنید.' });
-      }
-    } else if (order.current_step === 'address') {
-      if (!incomingText || incomingText.length < 5 || incomingText.length > 1000) {
-        await telegram('sendMessage', { chat_id: chatId, text: 'لطفاً آدرس دقیق و کامل را ارسال کنید.' });
-      } else {
-        const updated = await supabase(`orders?id=eq.${order.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ address: incomingText, current_step: 'receipt', updated_at: now })
-        });
-        order = updated?.[0] || order;
-        await telegram('sendMessage', { chat_id: chatId, text: 'حالا تصویر یا فایل رسید پرداخت را ارسال کنید. 📎' });
-      }
-    } else if (order.current_step === 'receipt') {
-      const rec = receiptData(message);
-      if (!rec) {
-        await telegram('sendMessage', { chat_id: chatId, text: 'لطفاً رسید پرداخت را به‌صورت عکس یا فایل ارسال کنید.' });
-      } else {
-        const updated = await supabase(`orders?id=eq.${order.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            receipt_file_id: rec.file_id,
-            receipt_file_unique_id: rec.unique_id,
-            receipt_type: rec.type,
-            status: 'pending_admin',
-            current_step: 'completed',
-            completed_at: now,
-            updated_at: now
-          })
-        });
-        order = updated?.[0] || order;
+        const updated = await supabase(
+          `orders?id=eq.${order.id}`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({
+              product_code: incomingText,
+              current_step: 'customer_name',
+              updated_at: now
+            })
+          }
+        );
 
-        // Telegram media captions have a 1024-character limit.
-        const caption = `🛒 سفارش جدید\n\n📦 کد محصول: ${order.product_code}\n👤 نام: ${order.customer_name}\n📍 آدرس: ${order.address}\n🆔 سفارش: ${order.id}`;
-        if (caption.length > 1024) throw new Error('Order caption exceeds Telegram 1024-character media caption limit');
-
-        let adminMessage;
-        if (rec.type === 'photo') {
-          adminMessage = await telegram('sendPhoto', { chat_id: ADMIN_CHAT_ID, photo: rec.file_id, caption });
-        } else {
-          adminMessage = await telegram('sendDocument', { chat_id: ADMIN_CHAT_ID, document: rec.file_id, caption });
-        }
-
-        await supabase(`orders?id=eq.${order.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ admin_message_id: adminMessage.message_id, updated_at: now })
-        });
+        order = updated?.[0] || order;
 
         await telegram('sendMessage', {
           chat_id: chatId,
-          text: '✅ سفارش شما با موفقیت ثبت شد.\nاطلاعات سفارش برای مدیریت ارسال شد.'
+          text:
+            'نام و نام خانوادگی خود را ارسال کنید.'
+        });
+      }
+
+    } else if (order.current_step === 'customer_name') {
+
+      if (!incomingText || incomingText.length > 150) {
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'نام و نام خانوادگی را به‌صورت کامل ارسال کنید.'
+        });
+      } else {
+        const updated = await supabase(
+          `orders?id=eq.${order.id}`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({
+              customer_name: incomingText,
+              current_step: 'address',
+              updated_at: now
+            })
+          }
+        );
+
+        order = updated?.[0] || order;
+
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'آدرس دقیق دریافت سفارش را ارسال کنید.'
+        });
+      }
+
+    } else if (order.current_step === 'address') {
+
+      if (
+        !incomingText ||
+        incomingText.length < 5 ||
+        incomingText.length > 1000
+      ) {
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'لطفاً آدرس دقیق و کامل را ارسال کنید.'
+        });
+      } else {
+        const updated = await supabase(
+          `orders?id=eq.${order.id}`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({
+              address: incomingText,
+              current_step: 'receipt',
+              updated_at: now
+            })
+          }
+        );
+
+        order = updated?.[0] || order;
+
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'حالا تصویر یا فایل رسید پرداخت را ارسال کنید. 📎'
+        });
+      }
+
+    } else if (order.current_step === 'receipt') {
+
+      const rec = receiptData(message);
+
+      if (!rec) {
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            'لطفاً رسید پرداخت را به‌صورت عکس یا فایل ارسال کنید.'
+        });
+      } else {
+
+        /*
+         * ابتدا اطلاعات رسید را در سفارش ذخیره می‌کنیم.
+         */
+        const updated = await supabase(
+          `orders?id=eq.${order.id}`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({
+              receipt_file_id: rec.file_id,
+              receipt_file_unique_id: rec.unique_id,
+              receipt_type: rec.type,
+              status: 'pending_admin',
+              current_step: 'completed',
+              completed_at: now,
+              updated_at: now
+            })
+          }
+        );
+
+        order = updated?.[0] || order;
+
+        /*
+         * انتقال رسید به Supabase Storage.
+         *
+         * اگر Storage خطا بدهد، سفارش همچنان ثبت می‌شود.
+         */
+        let storagePath = null;
+
+        try {
+          storagePath = await storeReceiptInStorage(
+            order.id,
+            rec
+          );
+
+          console.log(
+            `Receipt stored successfully: ${storagePath}`
+          );
+
+          // order را با مسیر جدید به‌روز می‌کنیم
+          order.receipt_storage_path = storagePath;
+
+        } catch (storageError) {
+          console.error(
+            'Receipt Storage error:',
+            storageError
+          );
+        }
+
+        // Telegram media captions have a 1024-character limit.
+        const caption =
+          `🛒 سفارش جدید\n\n` +
+          `📦 کد محصول: ${order.product_code}\n` +
+          `👤 نام: ${order.customer_name}\n` +
+          `📍 آدرس: ${order.address}\n` +
+          `🆔 سفارش: ${order.id}`;
+
+        if (caption.length > 1024) {
+          throw new Error(
+            'Order caption exceeds Telegram 1024-character media caption limit'
+          );
+        }
+
+        let adminMessage;
+
+        if (rec.type === 'photo') {
+          adminMessage = await telegram(
+            'sendPhoto',
+            {
+              chat_id: ADMIN_CHAT_ID,
+              photo: rec.file_id,
+              caption
+            }
+          );
+        } else {
+          adminMessage = await telegram(
+            'sendDocument',
+            {
+              chat_id: ADMIN_CHAT_ID,
+              document: rec.file_id,
+              caption
+            }
+          );
+        }
+
+        await supabase(
+          `orders?id=eq.${order.id}`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({
+              admin_message_id:
+                adminMessage.message_id,
+              updated_at: now
+            })
+          }
+        );
+
+        await telegram('sendMessage', {
+          chat_id: chatId,
+          text:
+            '✅ سفارش شما با موفقیت ثبت شد.\nاطلاعات سفارش برای مدیریت ارسال شد.'
         });
       }
     }
 
     return res.status(200).json({ ok: true });
+
   } catch (error) {
     console.error(error);
-    return res.status(200).json({ ok: false, error: 'internal_error' });
+
+    return res.status(200).json({
+      ok: false,
+      error: 'internal_error'
+    });
   }
 }
